@@ -1,18 +1,38 @@
 #!/usr/bin/env python3
 """UI Studio checker: plain-language quality checks for one HTML page.
 
-Usage: python3 check.py page.html [--mode persuade|operate|read|show] [--out DIR] [--json]
+Usage: python3 check.py page.html [--mode persuade|operate|read|show] [--out DIR]
+                         [--json] [--allow-network]
 
 Runs static checks with the standard library. If Playwright and a Chromium
 browser are available, it also renders the page at phone and desktop sizes,
-checks layout, contrast and the first screen, and saves screenshots.
-Nothing is sent over the network except what the page itself loads.
+checks layout, contrast and the first screen, and saves screenshots to
+.ui-studio-check/ next to the page (or --out DIR).
+
+While rendering, the page may only load local files and Google Fonts. Every
+other request is blocked unless you pass --allow-network, so a page you did not
+write cannot phone home. The checker itself never contacts the network.
+
+Exit codes: 0 nothing to fix, 1 at least one MUST FIX, 2 the check could not run.
 """
+import argparse
 import json
 import os
 import re
 import sys
 from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlsplit
+
+MODES = ("persuade", "operate", "read", "show")
+MAX_BYTES = 5 * 1024 * 1024
+OUT_DIRNAME = ".ui-studio-check"
+# Hosts a page may load from while rendering, without --allow-network.
+ALLOWED_HOSTS = frozenset({"fonts.googleapis.com", "fonts.gstatic.com"})
+LOCAL_SCHEMES = frozenset({"file", "data", "blob", "about"})
+# Elements that never have an end tag, so they must not go on the open-element stack.
+VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+                  "param", "source", "track", "wbr"})
 
 BUZZ = ["seamless", "robust", "empower", "supercharge", "elevate", "effortless",
         "unlock", "unleash", "revolutionize", "revolutionise", "cutting-edge",
@@ -24,6 +44,18 @@ PLACEHOLDER = ["lorem ipsum", "jane doe", "john doe", "john smith", "acme", "exa
 EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿\U0001F000-\U0001F2FF]")
 DEFAULT_FONTS = ["inter", "roboto", "open sans", "poppins", "montserrat", "lato",
                  "raleway", "nunito", "dm sans"]
+
+
+class CheckError(Exception):
+    """The check could not run (bad input), as opposed to the page having problems."""
+
+
+def _whole(phrase):
+    """Regex for a phrase as a whole word or name, not part of a longer one."""
+    return re.compile(r"(?<![\w-])" + re.escape(phrase) + r"(?![\w-])")
+
+
+PLACEHOLDER_RES = [(w, _whole(w)) for w in PLACEHOLDER]
 
 
 class Text(HTMLParser):
@@ -57,15 +89,24 @@ class Text(HTMLParser):
             self.label_depth += 1
         if tag == "label" and a.get("for"):
             self.labels_for.add(a["for"])
-        self._in.append(tag)
+        if tag not in VOID:
+            self._in.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        # Self-closed tags such as <br/> or <div/>: record them, leave nothing open.
+        self.handle_starttag(tag, attrs)
+        if tag not in VOID:
+            self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
         if tag == "label" and self.label_depth:
             self.label_depth -= 1
         if tag in ("script", "style", "noscript") and self.skip:
             self.skip -= 1
-        if self._in and self._in[-1] == tag:
-            self._in.pop()
+        if tag in self._in:
+            # Close up to and including the matching tag, tolerating unclosed children.
+            while self._in and self._in.pop() != tag:
+                pass
 
     def handle_data(self, data):
         if not self.skip and data.strip():
@@ -78,6 +119,7 @@ def static_checks(html):
     must, consider = [], []
     p = Text()
     p.feed(html)
+    p.close()
     text = " ".join(p.chunks)
     low = text.lower()
     css = "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", html, re.S | re.I))
@@ -86,7 +128,7 @@ def static_checks(html):
     found = sorted({w for w in BUZZ if re.search(r"\b" + re.escape(w) + r"\b", low)})
     if found:
         consider.append(f"Buzzwords in the copy ({', '.join(found)}). Say what it actually does, plainly.")
-    ph = sorted({w for w in PLACEHOLDER if w in low})
+    ph = sorted({w for w, rx in PLACEHOLDER_RES if rx.search(low)})
     if ph:
         must.append(f"Placeholder names or text left in ({', '.join(ph)}). Replace or mark clearly as a placeholder.")
     if re.search(r"\w+ · \w+ · \w+", text):
@@ -160,7 +202,7 @@ def static_checks(html):
 
 
 RENDER_JS = r"""
-() => {
+(opts) => {
   const vw = window.innerWidth, vh = window.innerHeight;
   const out = {overflow: document.documentElement.scrollWidth > vw + 1, lowContrast: [], eyebrows: [], accentWords: [], brokenImgs: 0, fold: {}, tinyText: 0};
   function rgb(s){const m=s.match(/rgba?\(([^)]+)\)/); if(!m) return null; const p=m[1].split(/[ ,/]+/).filter(Boolean).map(Number); return {r:p[0],g:p[1],b:p[2],a:p.length>3?p[3]:1};}
@@ -196,7 +238,12 @@ RENDER_JS = r"""
       if (cs.color!==hs.color || cs.fontStyle!==hs.fontStyle || cs.backgroundImage!=='none') { out.accentWords.push(h.textContent.trim().slice(0,60)); break; }
     }
   }
-  for (const img of document.images) if (img.complete && img.naturalWidth===0) out.brokenImgs++;
+  // With the network blocked, remote images fail by design; only count local ones then.
+  const local = (u) => /^(file|data|blob):/.test(u || '');
+  for (const img of document.images) {
+    if (!img.complete || img.naturalWidth !== 0) continue;
+    if (opts.allowNetwork || local(img.currentSrc || img.src)) out.brokenImgs++;
+  }
   const h1 = document.querySelector('h1');
   if (h1) {
     const hb = h1.getBoundingClientRect(); out.fold.h1 = hb.bottom <= vh;
@@ -214,29 +261,53 @@ RENDER_JS = r"""
 """
 
 
-def render_checks(path, outdir, mode="persuade"):
+def request_allowed(url, allow_network=False):
+    """Whether the rendered page may load this URL."""
+    if allow_network:
+        return True
+    parts = urlsplit(url)
+    if parts.scheme in LOCAL_SCHEMES:
+        return True
+    return parts.scheme == "https" and (parts.hostname or "") in ALLOWED_HOSTS
+
+
+def render_checks(path, outdir, mode="persuade", allow_network=False):
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
         return None
     must, consider, shots = [], [], []
-    url = "file://" + os.path.abspath(path)
+    blocked = set()
+    os.makedirs(outdir, exist_ok=True)
+    url = Path(path).resolve().as_uri()
     sizes = [("phone", 390, 844), ("laptop", 1280, 800), ("desktop", 1440, 900), ("wide", 1920, 1080), ("narrow", 320, 640)]
+
+    def route(r):
+        if request_allowed(r.request.url, allow_network):
+            r.continue_()
+        else:
+            blocked.add(urlsplit(r.request.url).hostname or r.request.url[:40])
+            r.abort()
+
     try:
         with sync_playwright() as pw:
             try:
                 browser = pw.chromium.launch()
             except Exception:
+                # Playwright's own Chromium isn't installed; use the system Chrome with a
+                # fresh temporary profile (no cookies or logins) and say so.
                 browser = pw.chromium.launch(channel="chrome")
+                consider.append("Rendered with your installed Chrome because Playwright's Chromium isn't installed (a fresh profile; no cookies or logins were used).")
             for name, w, h in sizes:
                 page = browser.new_page(viewport={"width": w, "height": h})
+                page.route("**/*", route)
                 errs = []
                 if name == "desktop":
-                    page.on("pageerror", lambda e: errs.append(str(e)[:120]))
-                    page.on("console", lambda m: errs.append(m.text[:120]) if m.type == "error" and "Failed to load resource" not in m.text else None)
+                    page.on("pageerror", lambda e, errs=errs: errs.append(str(e)[:120]))
+                    page.on("console", lambda m, errs=errs: errs.append(m.text[:120]) if m.type == "error" and "Failed to load resource" not in m.text else None)
                 page.goto(url, wait_until="networkidle", timeout=30000)
                 page.wait_for_timeout(600)
-                r = page.evaluate(RENDER_JS)
+                r = page.evaluate(RENDER_JS, {"allowNetwork": allow_network})
                 if r["overflow"]:
                     must.append(f"Sideways scrolling at {w}px wide ({name}).")
                 if name in ("phone", "laptop"):
@@ -245,7 +316,8 @@ def render_checks(path, outdir, mode="persuade"):
                     if r["fold"].get("cta") is False and mode == "persuade":
                         must.append(f"The main button ({r['fold'].get('ctaText','')!r}) isn't visible without scrolling on a {name} ({w}×{h}).")
                 if name == "desktop" and errs:
-                    must.append(f"Script errors in the page: {errs[:2]}")
+                    note = " Some may come from blocked network requests; rerun with --allow-network to compare." if blocked else ""
+                    must.append(f"Script errors in the page: {errs[:2]}.{note}")
                 if name == "desktop":
                     for c in r["lowContrast"][:8]:
                         must.append(f"Low contrast {c['ratio']}:1 (needs {c['need']}:1): \"{c['text']}\"")
@@ -270,24 +342,63 @@ def render_checks(path, outdir, mode="persuade"):
             browser.close()
     except Exception as e:
         consider.append(f"Could not render the page ({type(e).__name__}: {str(e)[:120]}). Only static checks ran.")
-        return must, consider, shots
+    if blocked:
+        hosts = ", ".join(sorted(blocked)[:5])
+        consider.append(f"Blocked requests to {len(blocked)} other host(s) while rendering ({hosts}). Screenshots may be missing those resources; rerun with --allow-network if you trust the page.")
     return must, consider, shots
 
 
-def main():
-    args = sys.argv[1:]
-    if not args:
-        print(__doc__)
-        sys.exit(2)
-    path = args[0]
-    outdir = os.path.dirname(os.path.abspath(path))
-    if "--out" in args:
-        outdir = args[args.index("--out") + 1]
-        os.makedirs(outdir, exist_ok=True)
-    html = open(path, encoding="utf-8").read()
+def read_page(path):
+    if not os.path.isfile(path):
+        raise CheckError(f"No such file: {path}")
+    size = os.path.getsize(path)
+    if size > MAX_BYTES:
+        raise CheckError(f"{path} is {size // 1024} KB; the checker reads pages up to {MAX_BYTES // (1024 * 1024)} MB.")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except UnicodeDecodeError:
+        raise CheckError(f"{path} is not UTF-8 text. Save it as UTF-8 and try again.") from None
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="check.py",
+        description="Plain-language quality checks for one HTML page.",
+        epilog="Exit codes: 0 nothing to fix, 1 at least one MUST FIX, 2 the check could not run.",
+    )
+    parser.add_argument("page", help="the HTML file to check")
+    parser.add_argument("--mode", choices=MODES, default="persuade",
+                        help="what the page is for (default: persuade)")
+    parser.add_argument("--out", metavar="DIR",
+                        help=f"where to save screenshots (default: {OUT_DIRNAME}/ next to the page)")
+    parser.add_argument("--json", action="store_true", help="print results as JSON")
+    parser.add_argument("--allow-network", action="store_true",
+                        help="let the page load any URL while rendering (default: local files and Google Fonts only)")
+    return parser.parse_args(argv)
+
+
+def _safe_console():
+    """Never crash on a console that can't show →, × or emoji (e.g. Windows cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+def main(argv=None):
+    _safe_console()
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        html = read_page(args.page)
+    except CheckError as e:
+        print(f"UI Studio check: {e}", file=sys.stderr)
+        return 2
+    outdir = args.out or os.path.join(os.path.dirname(os.path.abspath(args.page)), OUT_DIRNAME)
     must, consider, words = static_checks(html)
-    mode = args[args.index("--mode") + 1] if "--mode" in args else "persuade"
-    rendered = render_checks(path, outdir, mode)
+    rendered = render_checks(args.page, outdir, args.mode, args.allow_network)
     shots = []
     if rendered is None:
         consider.append("Rendering skipped (Playwright not installed). Look at the page in a browser at phone and desktop width.")
@@ -295,10 +406,10 @@ def main():
         must += rendered[0]
         consider += rendered[1]
         shots = rendered[2]
-    if "--json" in args:
+    if args.json:
         print(json.dumps({"must_fix": must, "consider": consider, "screenshots": shots, "words": words}, indent=1))
-        return
-    print(f"UI Studio check: {os.path.basename(path)} ({words} words of visible text)")
+        return 1 if must else 0
+    print(f"UI Studio check: {os.path.basename(args.page)} ({words} words of visible text)")
     print(f"\nMUST FIX ({len(must)})")
     for m in must:
         print(" - " + m)
@@ -309,8 +420,8 @@ def main():
         print("\nScreenshots (look at these):")
         for s in shots:
             print(" - " + s)
-    sys.exit(1 if must else 0)
+    return 1 if must else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
