@@ -1,0 +1,6 @@
+# Normalise line endings so the source tree, the built zip and every checkout match.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.zip binary

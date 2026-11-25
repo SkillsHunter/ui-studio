@@ -1,0 +1,4 @@
+# Optional: lets check.py render pages and take screenshots.
+#   pip install -r requirements-render.txt
+#   python -m playwright install chromium
+playwright==1.65.2

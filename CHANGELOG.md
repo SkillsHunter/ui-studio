@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.2 (unreleased)
+The skill's instructions are unchanged. This release hardens the checker and the way the skill is shipped.
+
+**Releases**
+- Release zips are built by GitHub Actions from `ui-studio/` and published on the Releases page with `SHA256SUMS` and a signed build provenance attestation. The zip is no longer committed to the repository.
+- New `ui-studio-single-file.zip`: the skill as one `SKILL.md` with the references inlined as appendices, generated from the same source so the two can't drift apart.
+- Builds are reproducible: the same source always gives byte-identical zips.
+- Line endings are normalised to LF (`.gitattributes`).
+
+**Checker (`check.py`)**
+- While rendering, the page may load only local files and Google Fonts; other requests are blocked and listed. `--allow-network` turns this off.
+- Screenshots go to `.ui-studio-check/` next to the page instead of beside it.
+- Fixed: tags with no closing tag (`<img>`, `<br>`, `<input>`) broke the arrow and emoji checks for buttons and links.
+- Fixed: placeholder names matched inside longer words ("John Smithson", "Acmeville").
+- Proper command-line parsing: an unknown `--mode` or a flag with no value now gives a clear error instead of a crash.
+- Clear errors (exit code 2) for a missing file, a file that isn't UTF-8, or a file over 5 MB.
+- Says when it fell back to your installed Chrome.
+- `--json` now uses the same exit codes as the normal output (1 when there is a MUST FIX).
+
+**Project**
+- Tests (pytest), linting (ruff), CI on Linux, Windows and macOS, Dependabot, and a security policy.
+
 ## 0.5.1 (2026-11-25)
 First public version.
 - **Only promise what the owner will keep up:** stable facts (days, areas, hours) over figures that change daily, such as "2 slots left".

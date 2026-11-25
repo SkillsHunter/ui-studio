@@ -1,0 +1,17 @@
+# Developer tooling only. The skill itself has no dependencies; check.py uses the
+# Python standard library, plus Playwright if it happens to be installed.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["render: renders pages in Chromium via Playwright (skipped when unavailable)"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+extend-exclude = ["dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+# The checker's message strings and regexes are long by nature; wrapping them hurts readability.
+ignore = ["E501"]
